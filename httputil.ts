@@ -75,14 +75,16 @@ function unescape(text: string): string {
 }
 
 /**
- * A zero-copy view over Node's incoming headers. Node already lowercases
- * every header name, so lookups go straight to the raw object — no
- * Object.entries, no Map built per request.
+ * A zero-copy view over incoming headers. Header names are already
+ * lowercased (by node:http before, by the raw server now), so lookups go
+ * straight to the raw object — no Object.entries, no Map built per request.
+ * The source is a plain record: node:http's IncomingHttpHeaders is the
+ * same shape, and the raw server builds one by lowercasing names itself.
  */
 export class IncomingHeadersMap {
-  private readonly source: import('node:http').IncomingHttpHeaders;
+  private readonly source: Record<string, string | string[] | undefined>;
 
-  constructor(source: import('node:http').IncomingHttpHeaders) {
+  constructor(source: Record<string, string | string[] | undefined>) {
     this.source = source;
   }
 

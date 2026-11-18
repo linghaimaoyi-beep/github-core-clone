@@ -1,6 +1,13 @@
-// app.ts — the HTTP server: reads each request whole, checks the bearer
-// token, routes to the git / REST / GraphQL / MCP handlers, and writes the
+// app.ts — the HTTP server: takes each complete request, checks the bearer
+// token, routes to the git / REST / GraphQL / MCP handlers, and returns the
 // reply. Only GET /healthz is unauthenticated (the env's boot probe).
+//
+// The transport is the hand-rolled HTTP/1.1 server in rawserver.ts, not
+// node:http: the kit's runner makes thousands of small sequential requests,
+// and node:http's per-request machinery (IncomingMessage/ServerResponse,
+// the readBody promise, writeHead/end bookkeeping) is a fixed tax on each
+// one. The raw server hands the whole request to this file synchronously,
+// so there is no stream to drain and no promise to await per request.
 //
 // Auth model: the shop token comes from MAKEFUN_SHOP_TOKEN. When the
 // environment sets one, the presented bearer token must match it exactly.
@@ -11,11 +18,12 @@
 // route names a foreign owner.
 //
 // Hot-path notes: the URL is split by hand (no `new URL()`), headers are
-// read straight off the socket object (no Map copy), bodies take a fast path
-// for GET/HEAD/empty and for a single chunk, and routing short-circuits on
-// cheap prefix checks before any regex runs.
+// read straight off the parsed object (no Map copy), bodies arrive whole
+// from the raw server, and routing short-circuits on cheap prefix checks
+// before any regex runs.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { type Server } from 'node:net';
+import { createRawServer, type RawRequest } from './rawserver.ts';
 import { Forge } from './store.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './githttp.ts';
 import { handleRest } from './rest.ts';
@@ -39,44 +47,8 @@ export function createForge(): Forge {
   return new Forge(token && token.length > 0 ? token : null);
 }
 
-const EMPTY_BUFFER = Buffer.alloc(0);
 const HEALTHZ_BODY = Buffer.from('{"ok":true,"status":"ok"}', 'utf8');
 const REF_HEAD_BODY = Buffer.from('ref: refs/heads/main\n', 'utf8');
-
-/**
- * Read a request body fully into a Buffer. GET/HEAD and empty bodies resolve
- * at once with no listeners attached; a one-chunk body (the usual 1 KiB
- * JSON or push) is returned as-is with no array and no concat.
- */
-function readRequestBody(req: IncomingMessage): Promise<Buffer> {
-  const method = req.method;
-  const contentLength = req.headers['content-length'];
-  if (contentLength === '0' || method === 'GET' || method === 'HEAD') {
-    // Drain the stream in case a client pipelined data onto a GET anyway.
-    req.resume();
-    return Promise.resolve(EMPTY_BUFFER);
-  }
-  return new Promise<Buffer>((resolve, reject) => {
-    let head: Buffer | null = null;
-    let tail: Buffer[] | null = null;
-    req.on('data', (chunk: Buffer | string) => {
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (head === null) {
-        head = buf;
-      } else if (tail === null) {
-        tail = [head, buf];
-      } else {
-        tail.push(buf);
-      }
-    });
-    req.on('end', () => {
-      if (head === null) resolve(EMPTY_BUFFER);
-      else if (tail === null) resolve(head);
-      else resolve(Buffer.concat(tail));
-    });
-    req.on('error', reject);
-  });
-}
 
 /**
  * The bearer token a request presents, or null when it presents none.
@@ -162,55 +134,52 @@ function dispatch(store: Forge, req: HttpRequest): HttpResponse {
   return notFound('Not Found');
 }
 
+/**
+ * Handle one complete request: split the URL by hand, build the request
+ * the handlers expect, check the bearer token, and dispatch. Synchronous:
+ * the raw server already holds the whole body, so there is no stream to
+ * drain and no promise to await. The auth and routing logic is the same
+ * as the old node:http callback — only the transport around it changed.
+ */
+function handleHttpRequest(store: Forge, raw: RawRequest): HttpResponse {
+  // Split path and query by hand: the request target is always
+  // origin-form ("/path?query"), never a full URL.
+  const rawUrl = raw.url;
+  const qIdx = rawUrl.indexOf('?');
+  const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+  const rawQuery = qIdx === -1 ? '' : rawUrl.slice(qIdx + 1);
+  const request: HttpRequest = {
+    method: raw.method,
+    pathname,
+    search: new FastSearchParams(rawQuery),
+    headers: new IncomingHeadersMap(raw.headers),
+    body: raw.body,
+  };
+  // Authentication: every route except /healthz needs the shop token.
+  // When the environment sets no token (local practice), any non-empty
+  // bearer token is accepted; a missing one is still refused.
+  if (pathname !== '/healthz') {
+    const auth = raw.headers.authorization;
+    const presented = extractBearer(typeof auth === 'string' ? auth : undefined);
+    if (presented === null) return unauthorized('Requires authentication');
+    if (store.token !== null && presented !== store.token) return unauthorized('Bad credentials');
+  }
+  return dispatch(store, request);
+}
+
 /** Create the HTTP server for one forge. */
 export function createApp(store: Forge = createForge()): Server {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      try {
-        const body = await readRequestBody(req);
-        // Split path and query by hand: the request target is always
-        // origin-form ("/path?query"), never a full URL.
-        const rawUrl = req.url ?? '/';
-        const qIdx = rawUrl.indexOf('?');
-        const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
-        const rawQuery = qIdx === -1 ? '' : rawUrl.slice(qIdx + 1);
-        const request: HttpRequest = {
-          method: req.method ?? 'GET',
-          pathname,
-          search: new FastSearchParams(rawQuery),
-          headers: new IncomingHeadersMap(req.headers),
-          body,
-        };
-        // Authentication: every route except /healthz needs the shop token.
-        // When the environment sets no token (local practice), any non-empty
-        // bearer token is accepted; a missing one is still refused.
-        let response: HttpResponse;
-        if (pathname !== '/healthz') {
-          const auth = req.headers.authorization;
-          const presented = extractBearer(typeof auth === 'string' ? auth : undefined);
-          if (presented === null) {
-            response = unauthorized('Requires authentication');
-          } else if (store.token !== null && presented !== store.token) {
-            response = unauthorized('Bad credentials');
-          } else {
-            response = dispatch(store, request);
-          }
-        } else {
-          response = dispatch(store, request);
-        }
-        res.writeHead(response.status, response.headers);
-        res.end(response.body);
-      } catch (err) {
-        // Never let one request take the server down: answer 500 and stay up.
-        process.stderr.write(`[entry] request failed: ${err instanceof Error ? err.message : String(err)}\n`);
-        if (!res.headersSent) {
-          res.writeHead(500, { 'content-type': 'application/json', 'X-GitHub-Request-Id': nextRequestId() });
-          res.end(JSON.stringify({ message: 'Internal Server Error' }));
-        } else {
-          res.end();
-        }
-      }
-    })();
+  return createRawServer((raw: RawRequest) => {
+    try {
+      return handleHttpRequest(store, raw);
+    } catch (err) {
+      // Never let one request take the server down: answer 500 and stay up.
+      process.stderr.write(`[entry] request failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      return {
+        status: 500,
+        headers: { 'content-type': 'application/json', 'X-GitHub-Request-Id': nextRequestId() },
+        body: Buffer.from(JSON.stringify({ message: 'Internal Server Error' }), 'utf8'),
+      };
+    }
   });
-  return server;
 }
