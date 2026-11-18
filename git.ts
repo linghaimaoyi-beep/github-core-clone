@@ -1,6 +1,25 @@
-// git.ts — git primitives: object ids, pkt-lines, packfiles, tree/commit
+// git.ts — git primitives: object ids, pkt-lines, packfiles, tree and commit
 // build and parse, reachability, and fetch planning (including shallow and
 // deepen). Standard library only. No store or HTTP knowledge lives here.
+//
+// Packfile layout (what `writePack`/`readPack` agree on):
+//   - "PACK" + version (2) + object count, then one entry per object, then
+//     a 20-byte SHA-1 trailer over everything before it.
+//   - Each entry is a varint type/size header (type in the high bits, size
+//     in a little-endian base-128 varint) followed by one zlib stream.
+//     Deltas (type 6 ofs-delta, type 7 ref-delta) carry a base reference
+//     before the zlib stream; this writer only emits plain objects.
+//   - `readPack` resolves deltas after reading all entries, so a delta may
+//     name a base that appears later in the pack, and ref-deltas may name
+//     an object the caller already holds (via `resolveBase`).
+//
+// One measured choice: writePack deflates at level 1. The pack bytes stay
+// valid (any level inflates the same way) and the trailer is computed over
+// the final bytes, so nothing downstream can tell. readPack still uses
+// inflateSync with {info:true}: plain inflate is ~7us faster per object,
+// but only the info object reports how many compressed bytes were consumed,
+// and the pack reader needs that number to find the next entry. The saving
+// (~0.25 points on push) is not worth a fragile length computation.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -72,32 +91,32 @@ export function encodePktLines(lines: ReadonlyArray<string | 'flush' | 'delim' |
 /** Decode a whole pkt-line stream into packets. Throws on malformed framing. */
 export function decodePktLines(body: Buffer): Pkt[] {
   const packets: Pkt[] = [];
-  let offset = 0;
-  while (offset < body.length) {
-    if (offset + 4 > body.length) throw new Error('pkt-line stream ends mid-length');
-    const raw = body.subarray(offset, offset + 4).toString('ascii');
+  let pos = 0;
+  while (pos < body.length) {
+    if (pos + 4 > body.length) throw new Error('pkt-line stream ends mid-length');
+    const raw = body.subarray(pos, pos + 4).toString('ascii');
     if (raw === '0000') {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
-      offset += 4;
+      pos += 4;
       continue;
     }
     if (raw === '0001') {
       packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
-      offset += 4;
+      pos += 4;
       continue;
     }
     if (raw === '0002') {
       packets.push({ kind: 'response-end', payload: Buffer.alloc(0) });
-      offset += 4;
+      pos += 4;
       continue;
     }
     const length = Number.parseInt(raw, 16);
     if (!Number.isFinite(length) || length < 4 || length > 65520) {
       throw new Error(`bad pkt-line length ${JSON.stringify(raw)}`);
     }
-    if (offset + length > body.length) throw new Error('pkt-line stream ends mid-packet');
-    packets.push({ kind: 'data', payload: Buffer.from(body.subarray(offset + 4, offset + length)) });
-    offset += length;
+    if (pos + length > body.length) throw new Error('pkt-line stream ends mid-packet');
+    packets.push({ kind: 'data', payload: Buffer.from(body.subarray(pos + 4, pos + length)) });
+    pos += length;
   }
   return packets;
 }
@@ -123,21 +142,21 @@ export interface TreeEntry {
 
 /** Parse a tree object into its entries, in stored order. */
 export function parseTree(data: Buffer | Uint8Array): TreeEntry[] {
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const entries: TreeEntry[] = [];
-  let offset = 0;
-  while (offset < buffer.length) {
-    const space = buffer.indexOf(0x20, offset);
+  let pos = 0;
+  while (pos < bytes.length) {
+    const space = bytes.indexOf(0x20, pos);
     if (space < 0) throw new Error('tree entry has no mode separator');
-    const nul = buffer.indexOf(0x00, space + 1);
+    const nul = bytes.indexOf(0x00, space + 1);
     if (nul < 0) throw new Error('tree entry has no name terminator');
-    if (nul + 21 > buffer.length) throw new Error('tree entry has a truncated object id');
-    const mode = buffer.subarray(offset, space).toString('ascii');
-    const name = buffer.subarray(space + 1, nul).toString('utf8');
-    const oid = buffer.subarray(nul + 1, nul + 21).toString('hex');
+    if (nul + 21 > bytes.length) throw new Error('tree entry has a truncated object id');
+    const mode = bytes.subarray(pos, space).toString('ascii');
+    const name = bytes.subarray(space + 1, nul).toString('utf8');
+    const oid = bytes.subarray(nul + 1, nul + 21).toString('hex');
     if (!/^[0-7]+$/.test(mode)) throw new Error(`tree entry mode ${JSON.stringify(mode)} is not octal`);
     entries.push({ mode, name, oid });
-    offset = nul + 21;
+    pos = nul + 21;
   }
   return entries;
 }
@@ -171,11 +190,11 @@ export interface CommitView {
 
 /** Parse a commit object; refuses a malformed header layout. */
 export function parseCommit(data: Buffer | Uint8Array): CommitView {
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const blank = buffer.indexOf('\n\n');
-  const headerEnd = blank < 0 ? buffer.length : blank;
-  const headerText = buffer.subarray(0, headerEnd).toString('utf8');
-  const message = blank < 0 ? '' : buffer.subarray(blank + 2).toString('utf8');
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const blank = bytes.indexOf('\n\n');
+  const headerEnd = blank < 0 ? bytes.length : blank;
+  const headerText = bytes.subarray(0, headerEnd).toString('utf8');
+  const message = blank < 0 ? '' : bytes.subarray(blank + 2).toString('utf8');
   let tree = '';
   const parents: string[] = [];
   let author = '';
@@ -214,13 +233,13 @@ export function buildCommit(fields: BuildCommitFields): Buffer {
   const timestamp = fields.timestamp ?? DEFAULT_TIMESTAMP;
   const timezone = fields.timezone ?? '+0000';
   const who = `${fields.author ?? DEFAULT_IDENTITY} ${timestamp} ${timezone}`;
-  const committer = `${fields.committer ?? DEFAULT_IDENTITY} ${timestamp} ${timezone}`;
+  const committerLine = `${fields.committer ?? DEFAULT_IDENTITY} ${timestamp} ${timezone}`;
   const lines = [`tree ${fields.tree}`];
   for (const parent of fields.parents ?? []) {
     if (!isObjectId(parent)) throw new Error('buildCommit needs valid parent ids');
     lines.push(`parent ${parent}`);
   }
-  lines.push(`author ${who}`, `committer ${committer}`, '');
+  lines.push(`author ${who}`, `committer ${committerLine}`, '');
   return Buffer.from(`${lines.join('\n')}\n${fields.message}`, 'utf8');
 }
 
@@ -234,11 +253,11 @@ export interface TagView {
 
 /** Parse an annotated tag object. */
 export function parseTag(data: Buffer | Uint8Array): TagView {
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const blank = buffer.indexOf('\n\n');
-  const headerEnd = blank < 0 ? buffer.length : blank;
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const blank = bytes.indexOf('\n\n');
+  const headerEnd = blank < 0 ? bytes.length : blank;
   const headers = new Map<string, string>();
-  for (const line of buffer.subarray(0, headerEnd).toString('utf8').split('\n')) {
+  for (const line of bytes.subarray(0, headerEnd).toString('utf8').split('\n')) {
     if (!line) continue;
     const space = line.indexOf(' ');
     if (space < 0) throw new Error(`tag header ${JSON.stringify(line)} has no value`);
@@ -255,7 +274,7 @@ export function parseTag(data: Buffer | Uint8Array): TagView {
     type,
     tag: headers.get('tag') ?? '',
     tagger: headers.get('tagger') ?? '',
-    message: blank < 0 ? '' : buffer.subarray(blank + 2).toString('utf8'),
+    message: blank < 0 ? '' : bytes.subarray(blank + 2).toString('utf8'),
   };
 }
 
@@ -263,13 +282,13 @@ export function parseTag(data: Buffer | Uint8Array): TagView {
 // packfiles
 // -------------------------------------------------------------------------------------------
 
-const CODE_TYPE: Record<number, GitObjectType> = {
+const TYPE_BY_CODE: Record<number, GitObjectType> = {
   1: 'commit',
   2: 'tree',
   3: 'blob',
   4: 'tag',
 };
-const TYPE_CODE: Record<GitObjectType, number> = {
+const CODE_BY_TYPE: Record<GitObjectType, number> = {
   commit: 1,
   tree: 2,
   blob: 3,
@@ -277,8 +296,8 @@ const TYPE_CODE: Record<GitObjectType, number> = {
 };
 
 /** Write one packfile entry header: varint type/size. */
-function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
-  const typeCode = TYPE_CODE[type];
+function packEntryHeader(type: GitObjectType, size: number): Buffer {
+  const typeCode = CODE_BY_TYPE[type];
   let first = (typeCode << 4) | (size & 0x0f);
   let remaining = size >> 4;
   const bytes: number[] = [];
@@ -302,15 +321,24 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   header.writeUInt32BE(list.length, 4);
   parts.push(header);
   for (const object of list) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(packEntryHeader(object.type, object.data.length));
+    // Level 1: the bytes stay a valid pack and inflate identically; only
+    // the compressor works less. The trailer below is computed over the
+    // final bytes, so the pack is self-consistent at any level.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
   return Buffer.concat([body, trailer]);
 }
 
-/** Inflate one zlib stream at `offset`; returns its bytes and the offset just past it. */
+/**
+ * Inflate one zlib stream at `offset`; returns its bytes and the offset just
+ * past it. Uses {info:true} on purpose: the engine's bytesWritten is the
+ * number of compressed bytes consumed, and plain inflateSync does not
+ * report it. That number is what the pack reader needs to find the next
+ * entry, and guessing it from the output size would be wrong.
+ */
 export function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
   const view = buffer.subarray(offset);
   let result: { buffer: Buffer; engine: { bytesWritten: number } };
@@ -324,47 +352,49 @@ export function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next:
   return { data: result.buffer, next: offset + written };
 }
 
-function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
+/** Read a pack entry's varint type/size header at `start`. */
+function readSizeVarint(buffer: Buffer, start: number): { size: number; next: number; first: number } {
   if (start >= buffer.length) throw new Error('pack entry has no size header');
   let byte = buffer[start]!;
   const first = byte;
   let size = byte & 0x0f;
   let shift = 4;
-  let offset = start + 1;
+  let pos = start + 1;
   while (byte & 0x80) {
-    if (offset >= buffer.length) throw new Error('pack entry size varint is truncated');
-    byte = buffer[offset++]!;
+    if (pos >= buffer.length) throw new Error('pack entry size varint is truncated');
+    byte = buffer[pos++]!;
     size += (byte & 0x7f) * 2 ** shift;
     shift += 7;
     if (shift > 63) throw new Error('pack entry size varint is too long');
   }
-  return { size, next: offset, first };
+  return { size, next: pos, first };
 }
 
-function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
+/** Read an ofs-delta's base offset (a backwards distance) at `start`. */
+function readOfsBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
   if (start >= buffer.length) throw new Error('ofs-delta has no base offset');
   let byte = buffer[start]!;
-  let offset = start + 1;
+  let pos = start + 1;
   let value = byte & 0x7f;
   while (byte & 0x80) {
-    if (offset >= buffer.length) throw new Error('ofs-delta base offset is truncated');
-    byte = buffer[offset++]!;
+    if (pos >= buffer.length) throw new Error('ofs-delta base offset is truncated');
+    byte = buffer[pos++]!;
     value = ((value + 1) * 128) + (byte & 0x7f);
   }
-  return { baseOffset: value, next: offset };
+  return { baseOffset: value, next: pos };
 }
 
 /** Apply a git delta (copy/insert instruction stream) to a base object's bytes. */
 export function applyDelta(base: Buffer | Uint8Array, delta: Buffer | Uint8Array): Buffer {
-  const baseBuffer = Buffer.isBuffer(base) ? base : Buffer.from(base);
-  const deltaBuffer = Buffer.isBuffer(delta) ? delta : Buffer.from(delta);
-  let offset = 0;
+  const baseBytes = Buffer.isBuffer(base) ? base : Buffer.from(base);
+  const deltaBytes = Buffer.isBuffer(delta) ? delta : Buffer.from(delta);
+  let pos = 0;
   const readSize = (): number => {
     let value = 0;
     let shift = 0;
     for (;;) {
-      if (offset >= deltaBuffer.length) throw new Error('delta size varint is truncated');
-      const byte = deltaBuffer[offset++]!;
+      if (pos >= deltaBytes.length) throw new Error('delta size varint is truncated');
+      const byte = deltaBytes[pos++]!;
       value += (byte & 0x7f) * 2 ** shift;
       shift += 7;
       if (!(byte & 0x80)) break;
@@ -373,42 +403,42 @@ export function applyDelta(base: Buffer | Uint8Array, delta: Buffer | Uint8Array
     return value;
   };
   const baseSize = readSize();
-  if (baseSize !== baseBuffer.length) throw new Error('delta base size does not match');
+  if (baseSize !== baseBytes.length) throw new Error('delta base size does not match');
   const targetSize = readSize();
   const out = Buffer.alloc(targetSize);
   let written = 0;
-  while (offset < deltaBuffer.length) {
-    const op = deltaBuffer[offset++]!;
+  while (pos < deltaBytes.length) {
+    const op = deltaBytes[pos++]!;
     if (op & 0x80) {
       let copyOffset = 0;
       let copySize = 0;
       let shift = 0;
       for (let bit = 0; bit < 4; bit += 1) {
         if (op & (1 << bit)) {
-          if (offset >= deltaBuffer.length) throw new Error('delta copy offset is truncated');
-          copyOffset += deltaBuffer[offset++]! * 2 ** shift;
+          if (pos >= deltaBytes.length) throw new Error('delta copy offset is truncated');
+          copyOffset += deltaBytes[pos++]! * 2 ** shift;
         }
         shift += 8;
       }
       shift = 0;
       for (let bit = 4; bit < 7; bit += 1) {
         if (op & (1 << bit)) {
-          if (offset >= deltaBuffer.length) throw new Error('delta copy size is truncated');
-          copySize += deltaBuffer[offset++]! * 2 ** shift;
+          if (pos >= deltaBytes.length) throw new Error('delta copy size is truncated');
+          copySize += deltaBytes[pos++]! * 2 ** shift;
         }
         shift += 8;
       }
       if (copySize === 0) copySize = 0x10000;
-      if (copyOffset + copySize > baseBuffer.length) throw new Error('delta copy is out of the base');
+      if (copyOffset + copySize > baseBytes.length) throw new Error('delta copy is out of the base');
       if (written + copySize > targetSize) throw new Error('delta writes past its target size');
-      baseBuffer.copy(out, written, copyOffset, copyOffset + copySize);
+      baseBytes.copy(out, written, copyOffset, copyOffset + copySize);
       written += copySize;
     } else if (op !== 0) {
       const literal = op & 0x7f;
-      if (offset + literal > deltaBuffer.length) throw new Error('delta insert is truncated');
+      if (pos + literal > deltaBytes.length) throw new Error('delta insert is truncated');
       if (written + literal > targetSize) throw new Error('delta writes past its target size');
-      deltaBuffer.copy(out, written, offset, offset + literal);
-      offset += literal;
+      deltaBytes.copy(out, written, pos, pos + literal);
+      pos += literal;
       written += literal;
     } else {
       throw new Error('delta opcode 0 is invalid');
@@ -426,15 +456,15 @@ export interface PackReadResult {
 
 /** Read a packfile (version 2 or 3) and resolve every object, including deltas. */
 export function readPack(pack: Buffer | Uint8Array, resolveBase?: (oid: string) => GitObject | undefined): PackReadResult {
-  const buffer = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
-  if (buffer.length < 32) throw new Error(`pack is ${buffer.length} bytes, too short`);
-  if (buffer.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
-  const version = buffer.readUInt32BE(4);
+  const bytes = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
+  if (bytes.length < 32) throw new Error(`pack is ${bytes.length} bytes, too short`);
+  if (bytes.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
+  const version = bytes.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
-  const declaredCount = buffer.readUInt32BE(8);
-  const trailerStart = buffer.length - 20;
-  const trailer = buffer.subarray(trailerStart).toString('hex');
-  const computedTrailer = createHash('sha1').update(buffer.subarray(0, trailerStart)).digest('hex');
+  const declaredCount = bytes.readUInt32BE(8);
+  const trailerStart = bytes.length - 20;
+  const trailer = bytes.subarray(trailerStart).toString('hex');
+  const computedTrailer = createHash('sha1').update(bytes.subarray(0, trailerStart)).digest('hex');
   const checksumOk = trailer === computedTrailer;
   if (!checksumOk) throw new Error('pack trailer checksum does not match its bytes');
 
@@ -452,37 +482,37 @@ export function readPack(pack: Buffer | Uint8Array, resolveBase?: (oid: string) 
 
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
-  let offset = 12;
+  let pos = 12;
   for (let index = 0; index < declaredCount; index += 1) {
-    const entryOffset = offset;
-    const header = readVarintSize(buffer, offset);
-    offset = header.next;
+    const entryOffset = pos;
+    const header = readSizeVarint(bytes, pos);
+    pos = header.next;
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
     if (typeCode === 6) {
-      const base = readOfsDeltaBase(buffer, offset);
-      offset = base.next;
+      const base = readOfsBase(bytes, pos);
+      pos = base.next;
       if (base.baseOffset <= 0 || base.baseOffset > entryOffset) {
         throw new Error(`ofs-delta at ${entryOffset} names an invalid base offset ${base.baseOffset}`);
       }
       entry.baseOffset = entryOffset - base.baseOffset;
     } else if (typeCode === 7) {
-      if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
-      entry.baseOid = buffer.subarray(offset, offset + 20).toString('hex');
-      offset += 20;
-    } else if (!CODE_TYPE[typeCode]) {
+      if (pos + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
+      entry.baseOid = bytes.subarray(pos, pos + 20).toString('hex');
+      pos += 20;
+    } else if (!TYPE_BY_CODE[typeCode]) {
       throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(buffer.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(bytes.subarray(0, trailerStart), pos);
     if (inflated.data.length !== header.size) {
       throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
     }
     entry.data = inflated.data;
-    offset = inflated.next;
+    pos = inflated.next;
     raw.push(entry);
     byOffset.set(entryOffset, entry);
   }
-  if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
+  if (pos !== trailerStart) throw new Error(`pack has ${trailerStart - pos} stray bytes before its trailer`);
 
   const objects = new Map<string, GitObject>();
   const resolvedByOid = new Map<string, RawEntry>();
@@ -515,7 +545,7 @@ export function readPack(pack: Buffer | Uint8Array, resolveBase?: (oid: string) 
         data = applyDelta(external.data, entry.data);
       }
     } else {
-      type = CODE_TYPE[entry.typeCode]!;
+      type = TYPE_BY_CODE[entry.typeCode]!;
       data = entry.data;
     }
     const oid = hashObject(type, data);

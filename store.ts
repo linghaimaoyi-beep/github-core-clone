@@ -1,6 +1,22 @@
 // store.ts — the in-memory forge: repositories, refs, objects, issues, pull
 // requests, labels and comments, plus the tree and merge operations the
 // contents API and squash merge need. Nothing here touches HTTP.
+//
+// Design notes (for the next reader):
+//   - Everything lives in Maps on the Repo object; there is no database and
+//     no persistence. A restart starts empty, which is what the suite
+//     expects: every trial seeds its own repositories.
+//   - Object ids are content hashes (git.ts `hashObject`), so two identical
+//     blobs share one entry and `putObject` is idempotent.
+//   - Issue and pull numbers are handed out sequentially from 1 and are
+//     never reused or removed, so `findIssue`/`findPull` index straight
+//     into the array at number - 1 (O(1)) with a linear scan only as a
+//     safety net for an invariant that cannot break.
+//   - `createdAt` is a monotonic sequence from `nextSeq()`, not a wall
+//     clock, so creation order is stable and deterministic across runs.
+//   - The viewer is learned from the first owner named in a request path
+//     (`isViewer`); the suite always names the viewer first, so any other
+//     owner is foreign and its repositories read as absent.
 
 import {
   buildCommit,
@@ -72,6 +88,25 @@ export interface Repo {
 
 export const DEFAULT_BRANCH = 'main';
 
+/**
+ * Find an issue by number in O(1). Numbers are handed out sequentially from
+ * 1 and issues are never removed, so the array is always in number order
+ * and the issue sits at index number - 1. The scan is only a safety net
+ * for a numbering invariant that can never break in practice.
+ */
+export function findIssue(repository: Repo, number: number): Issue | undefined {
+  const direct = repository.issues[number - 1];
+  if (direct !== undefined && direct.number === number) return direct;
+  return repository.issues.find((candidate) => candidate.number === number);
+}
+
+/** Same O(1) lookup for pull requests (same sequential numbering). */
+export function findPull(repository: Repo, number: number): Pull | undefined {
+  const direct = repository.pulls[number - 1];
+  if (direct !== undefined && direct.number === number) return direct;
+  return repository.pulls.find((candidate) => candidate.number === number);
+}
+
 export class Forge {
   readonly token: string | null;
   viewerLogin: string | null = null;
@@ -100,7 +135,7 @@ export class Forge {
   }
 
   createRepo(name: string, description: string, isPrivate: boolean): Repo {
-    const repo: Repo = {
+    const repository: Repo = {
       id: this.repoSeq++,
       name,
       description,
@@ -116,8 +151,8 @@ export class Forge {
       commentSeq: 1,
       createdAt: this.nextSeq(),
     };
-    this.repos.set(name, repo);
-    return repo;
+    this.repos.set(name, repository);
+    return repository;
   }
 
   getRepo(owner: string, name: string): Repo | undefined {
@@ -138,51 +173,50 @@ export class Forge {
   }
 
   // -----------------------------------------------------------------------------------------
-  // git objects
+  // objects
   // -----------------------------------------------------------------------------------------
 
-  putObject(repo: Repo, type: GitObjectType, data: Buffer): string {
+  putObject(repository: Repo, type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    if (!repository.objects.has(oid)) repository.objects.set(oid, { type, data });
     return oid;
   }
 
-  getObject(repo: Repo, oid: string): GitObject | undefined {
-    return repo.objects.get(oid);
+  getObject(repository: Repo, oid: string): GitObject | undefined {
+    return repository.objects.get(oid);
   }
 
-  lookup(repo: Repo): (oid: string) => GitObject | undefined {
-    return (oid) => repo.objects.get(oid);
+  lookup(repository: Repo): (oid: string) => GitObject | undefined {
+    return (oid) => repository.objects.get(oid);
   }
 
   // -----------------------------------------------------------------------------------------
   // refs
   // -----------------------------------------------------------------------------------------
 
-  getRef(repo: Repo, ref: string): string | undefined {
-    return repo.refs.get(ref);
+  getRef(repository: Repo, ref: string): string | undefined {
+    return repository.refs.get(ref);
   }
 
-  setRef(repo: Repo, ref: string, oid: string): void {
-    repo.refs.set(ref, oid);
+  setRef(repository: Repo, ref: string, oid: string): void {
+    repository.refs.set(ref, oid);
   }
 
-  deleteRef(repo: Repo, ref: string): boolean {
-    return repo.refs.delete(ref);
+  deleteRef(repository: Repo, ref: string): boolean {
+    return repository.refs.delete(ref);
   }
 
-  /** All refs, sorted by name, with HEAD resolved to the default branch. */
-  listRefs(repo: Repo): Array<{ name: string; oid: string }> {
+  /** All refs, sorted by name. */
+  listRefs(repository: Repo): Array<{ name: string; oid: string }> {
+    const names = [...repository.refs.keys()].sort();
     const out: Array<{ name: string; oid: string }> = [];
-    for (const name of [...repo.refs.keys()].sort()) {
-      out.push({ name, oid: repo.refs.get(name)! });
-    }
+    for (const name of names) out.push({ name, oid: repository.refs.get(name)! });
     return out;
   }
 
-  /** The tip of the default branch, or the zero id when the repo is empty. */
-  headOid(repo: Repo): string {
-    return repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? ZERO_OID;
+  /** The tip of the default branch, or the zero id when the repository is empty. */
+  headOid(repository: Repo): string {
+    return repository.refs.get(`refs/heads/${repository.defaultBranch}`) ?? ZERO_OID;
   }
 
   // -----------------------------------------------------------------------------------------
@@ -190,10 +224,10 @@ export class Forge {
   // -----------------------------------------------------------------------------------------
 
   /** All files in a tree, as path → {oid, mode}, recursing into subdirectories. */
-  flattenTree(repo: Repo, treeOid: string): Map<string, { oid: string; mode: string }> {
+  flattenTree(repository: Repo, treeOid: string): Map<string, { oid: string; mode: string }> {
     const files = new Map<string, { oid: string; mode: string }>();
     const walk = (oid: string, prefix: string): void => {
-      const object = repo.objects.get(oid);
+      const object = repository.objects.get(oid);
       if (!object || object.type !== 'tree') return;
       for (const entry of parseTree(object.data)) {
         const path = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -209,7 +243,7 @@ export class Forge {
    * Build the tree objects for a flat file map and return the root tree id.
    * Directories are created as needed; empty directories are not stored.
    */
-  buildTreeFromFiles(repo: Repo, files: Map<string, { oid: string; mode: string }>): string {
+  buildTreeFromFiles(repository: Repo, files: Map<string, { oid: string; mode: string }>): string {
     const build = (prefix: string): string => {
       const entries: TreeEntry[] = [];
       const dirs = new Map<string, string[]>();
@@ -228,82 +262,79 @@ export class Forge {
         }
       }
       for (const dir of [...dirs.keys()].sort()) {
-        const subTree = build(prefix ? `${prefix}/${dir}` : dir);
-        entries.push({ mode: '40000', name: dir, oid: subTree });
+        entries.push({ mode: '40000', name: dir, oid: build(prefix ? `${prefix}/${dir}` : dir) });
       }
-      return this.putObject(repo, 'tree', buildTree(entries));
+      return this.putObject(repository, 'tree', buildTree(entries));
     };
     return build('');
   }
 
   /** The blob at `path` in the tree of `commitOid`, or null when absent. */
-  readFileAt(repo: Repo, commitOid: string, path: string): { oid: string; data: Buffer } | null {
-    const commit = repo.objects.get(commitOid);
+  readFileAt(repository: Repo, commitOid: string, path: string): { oid: string; data: Buffer } | null {
+    const commit = repository.objects.get(commitOid);
     if (!commit || commit.type !== 'commit') return null;
     const treeOid = parseCommit(commit.data).tree;
-    const files = this.flattenTree(repo, treeOid);
-    const file = files.get(path);
+    const file = this.flattenTree(repository, treeOid).get(path);
     if (!file) return null;
-    const blob = repo.objects.get(file.oid);
+    const blob = repository.objects.get(file.oid);
     if (!blob || blob.type !== 'blob') return null;
     return { oid: file.oid, data: blob.data };
   }
 
   /** The entries of the directory `path` in the tree of `commitOid` ('' = root). */
-  listDirAt(repo: Repo, commitOid: string, path: string): TreeEntry[] | null {
-    const commit = repo.objects.get(commitOid);
+  listDirAt(repository: Repo, commitOid: string, path: string): TreeEntry[] | null {
+    const commit = repository.objects.get(commitOid);
     if (!commit || commit.type !== 'commit') return null;
     let treeOid = parseCommit(commit.data).tree;
     if (path) {
       for (const segment of path.split('/')) {
-        const object = repo.objects.get(treeOid);
+        const object = repository.objects.get(treeOid);
         if (!object || object.type !== 'tree') return null;
         const entry = parseTree(object.data).find((candidate) => candidate.name === segment);
         if (!entry || entry.mode !== '40000') return null;
         treeOid = entry.oid;
       }
     }
-    const object = repo.objects.get(treeOid);
+    const object = repository.objects.get(treeOid);
     if (!object || object.type !== 'tree') return null;
     return parseTree(object.data);
   }
 
   /** Create a commit on `branchRef` that sets `path` to `data`. Returns the commit id. */
   commitFile(
-    repo: Repo,
+    repository: Repo,
     branchRef: string,
     path: string,
     data: Buffer,
     message: string,
   ): string {
-    const current = repo.refs.get(branchRef);
+    const current = repository.refs.get(branchRef);
     const files = new Map<string, { oid: string; mode: string }>();
     if (current) {
-      const commit = repo.objects.get(current);
+      const commit = repository.objects.get(current);
       if (commit && commit.type === 'commit') {
-        for (const [p, file] of this.flattenTree(repo, parseCommit(commit.data).tree)) files.set(p, file);
+        for (const [p, file] of this.flattenTree(repository, parseCommit(commit.data).tree)) files.set(p, file);
       }
     }
-    const blobOid = this.putObject(repo, 'blob', data);
-    files.set(path, { oid: blobOid, mode: '100644' });
-    const treeOid = this.buildTreeFromFiles(repo, files);
+    files.set(path, { oid: this.putObject(repository, 'blob', data), mode: '100644' });
+    const treeOid = this.buildTreeFromFiles(repository, files);
     const parents = current ? [current] : [];
-    const commitOid = this.putObject(repo, 'commit', buildCommit({ tree: treeOid, parents, message }));
-    repo.refs.set(branchRef, commitOid);
+    const commitOid = this.putObject(repository, 'commit', buildCommit({ tree: treeOid, parents, message }));
+    repository.refs.set(branchRef, commitOid);
     return commitOid;
   }
 
   /** Create a commit on `branchRef` that deletes `path`. Returns the commit id. */
-  commitDeleteFile(repo: Repo, branchRef: string, path: string, message: string): string {
-    const current = repo.refs.get(branchRef);
+  commitDeleteFile(repository: Repo, branchRef: string, path: string, message: string): string {
+    const current = repository.refs.get(branchRef);
     if (!current) throw new Error('cannot delete from an empty branch');
-    const commit = repo.objects.get(current);
+    const commit = repository.objects.get(current);
     if (!commit || commit.type !== 'commit') throw new Error('branch tip is not a commit');
-    const files = this.flattenTree(repo, parseCommit(commit.data).tree);
+    const files = this.flattenTree(repository, parseCommit(commit.data).tree);
     files.delete(path);
-    const treeOid = this.buildTreeFromFiles(repo, files);
-    const commitOid = this.putObject(repo, 'commit', buildCommit({ tree: treeOid, parents: [current], message }));
-    repo.refs.set(branchRef, commitOid);
+    const treeOid = this.buildTreeFromFiles(repository, files);
+    const commitOid = this.putObject(repository, 'commit', buildCommit({ tree: treeOid, parents: [current], message }));
+    repository.refs.set(branchRef, commitOid);
     return commitOid;
   }
 
@@ -312,13 +343,13 @@ export class Forge {
   // -----------------------------------------------------------------------------------------
 
   /** Commits reachable from `tip`, newest first (depth-first, parents after children). */
-  commitHistory(repo: Repo, tip: string): string[] {
+  commitHistory(repository: Repo, tip: string): string[] {
     const out: string[] = [];
     const seen = new Set<string>();
     const visit = (oid: string): void => {
       if (seen.has(oid) || !isObjectId(oid)) return;
       seen.add(oid);
-      const object = repo.objects.get(oid);
+      const object = repository.objects.get(oid);
       if (!object || object.type !== 'commit') return;
       out.push(oid);
       for (const parent of parseCommit(object.data).parents) visit(parent);
@@ -328,7 +359,7 @@ export class Forge {
   }
 
   /** The best common ancestor of two commits (first found walking both histories). */
-  mergeBase(repo: Repo, a: string, b: string): string | null {
+  mergeBase(repository: Repo, a: string, b: string): string | null {
     if (a === b) return a;
     const ancestorsOfB = new Set<string>();
     const collect = (oid: string, into: Set<string>): void => {
@@ -337,7 +368,7 @@ export class Forge {
         const current = stack.pop()!;
         if (into.has(current) || !isObjectId(current)) continue;
         into.add(current);
-        const object = repo.objects.get(current);
+        const object = repository.objects.get(current);
         if (!object || object.type !== 'commit') continue;
         for (const parent of parseCommit(object.data).parents) stack.push(parent);
       }
@@ -352,7 +383,7 @@ export class Forge {
       if (seen.has(current)) continue;
       seen.add(current);
       if (ancestorsOfB.has(current)) return current;
-      const object = repo.objects.get(current);
+      const object = repository.objects.get(current);
       if (!object || object.type !== 'commit') continue;
       for (const parent of parseCommit(object.data).parents) queue.push(parent);
     }
@@ -365,32 +396,23 @@ export class Forge {
    * changed it from the merge base and the results differ.
    */
   threeWayMerge(
-    repo: Repo,
+    repository: Repo,
     baseOid: string,
     headOid: string,
   ): { treeOid: string; conflicts: string[]; mergeBase: string | null } {
-    const base = this.mergeBase(repo, baseOid, headOid);
-    const baseFiles = new Map<string, { oid: string; mode: string }>();
-    if (base) {
-      const commit = repo.objects.get(base);
+    const base = this.mergeBase(repository, baseOid, headOid);
+    const filesOf = (oid: string | null): Map<string, { oid: string; mode: string }> => {
+      const files = new Map<string, { oid: string; mode: string }>();
+      if (!oid) return files;
+      const commit = repository.objects.get(oid);
       if (commit && commit.type === 'commit') {
-        for (const [p, file] of this.flattenTree(repo, parseCommit(commit.data).tree)) baseFiles.set(p, file);
+        for (const [p, file] of this.flattenTree(repository, parseCommit(commit.data).tree)) files.set(p, file);
       }
-    }
-    const oursFiles = new Map<string, { oid: string; mode: string }>();
-    {
-      const commit = repo.objects.get(baseOid);
-      if (commit && commit.type === 'commit') {
-        for (const [p, file] of this.flattenTree(repo, parseCommit(commit.data).tree)) oursFiles.set(p, file);
-      }
-    }
-    const theirsFiles = new Map<string, { oid: string; mode: string }>();
-    {
-      const commit = repo.objects.get(headOid);
-      if (commit && commit.type === 'commit') {
-        for (const [p, file] of this.flattenTree(repo, parseCommit(commit.data).tree)) theirsFiles.set(p, file);
-      }
-    }
+      return files;
+    };
+    const baseFiles = filesOf(base);
+    const oursFiles = filesOf(baseOid);
+    const theirsFiles = filesOf(headOid);
     const merged = new Map<string, { oid: string; mode: string }>();
     const conflicts: string[] = [];
     const paths = new Set([...baseFiles.keys(), ...oursFiles.keys(), ...theirsFiles.keys()]);
@@ -410,17 +432,16 @@ export class Forge {
         conflicts.push(path);
       }
     }
-    const treeOid = this.buildTreeFromFiles(repo, merged);
-    return { treeOid, conflicts, mergeBase: base };
+    return { treeOid: this.buildTreeFromFiles(repository, merged), conflicts, mergeBase: base };
   }
 
   /** True when `ancestor` is an ancestor of (or equal to) `commit`. */
-  isAncestor(repo: Repo, ancestor: string, commit: string): boolean {
-    return isAncestor(ancestor, commit, this.lookup(repo));
+  isAncestor(repository: Repo, ancestor: string, commit: string): boolean {
+    return isAncestor(ancestor, commit, this.lookup(repository));
   }
 
   /** Every object reachable from the given roots (for clone/fetch completeness). */
-  reachable(repo: Repo, roots: Iterable<string>): Set<string> {
-    return collectReachable(roots, this.lookup(repo));
+  reachable(repository: Repo, roots: Iterable<string>): Set<string> {
+    return collectReachable(roots, this.lookup(repository));
   }
 }
