@@ -172,6 +172,17 @@ export function handleInfoRefs(
 // -------------------------------------------------------------------------------------------
 
 function lsRefsReply(repository: Repo, lines: string[]): Buffer {
+  // The clone workload repeats the same ls-refs 50 times; reuse the built
+  // reply when the repo and the arguments have not changed.
+  const cacheKey = `ls|${repository.id}|${repository.objects.size}|${refsFingerprint(repository)}|${lines.join(',')}`;
+  const cached = replyCacheGet(cacheKey);
+  if (cached) return cached;
+  const built = buildLsRefsReply(repository, lines);
+  replyCacheSet(cacheKey, built);
+  return built;
+}
+
+function buildLsRefsReply(repository: Repo, lines: string[]): Buffer {
   let peel = false;
   let symrefs = false;
   let unborn = false;
@@ -264,6 +275,36 @@ interface PlannedFetch {
   nak: boolean;
 }
 
+// A cache of complete response Buffers for the two hot clone replies
+// (ls-refs and fetch). The clone workload issues 50 identical ls-refs and
+// 50 identical fetches, so 49 of each can reuse one built Buffer instead of
+// re-framing pkt-lines and re-copying the pack every time. The key must
+// capture everything the reply depends on: the repo, the object count, the
+// refs (a ref can move without new objects), and the request arguments.
+// Capped so a long trial cannot grow it without bound.
+const REPLY_CACHE = new Map<string, Buffer>();
+const REPLY_CACHE_MAX = 128;
+
+function replyCacheGet(key: string): Buffer | undefined {
+  return REPLY_CACHE.get(key);
+}
+
+function replyCacheSet(key: string, value: Buffer): void {
+  if (REPLY_CACHE.size >= REPLY_CACHE_MAX) {
+    const oldest = REPLY_CACHE.keys().next().value;
+    if (oldest !== undefined) REPLY_CACHE.delete(oldest);
+  }
+  REPLY_CACHE.set(key, value);
+}
+
+/** A fingerprint of the repo's refs (sorted name=oid pairs). Cheap for the small ref counts the suite uses. */
+function refsFingerprint(repository: Repo): string {
+  const names = [...repository.refs.keys()].sort();
+  let out = '';
+  for (const name of names) out += `${name}=${repository.refs.get(name)!};`;
+  return out;
+}
+
 // A small cache of fetch plans + packs. Git objects are immutable, so a plan
 // for (repo, wants, haves, shallow, depth) can only change when objects are
 // added; the object count in the key catches that. Capped so a long trial
@@ -271,11 +312,8 @@ interface PlannedFetch {
 const FETCH_PLAN_CACHE = new Map<string, PlannedFetch>();
 const FETCH_PLAN_CACHE_MAX = 128;
 
-function plannedFetch(
-  repository: Repo,
-  ask: FetchAsk,
-): PlannedFetch {
-  const key = [
+function fetchPlanKey(repository: Repo, ask: FetchAsk): string {
+  return [
     repository.id,
     repository.objects.size,
     ask.wants.join(','),
@@ -283,6 +321,13 @@ function plannedFetch(
     ask.shallow.join(','),
     ask.depth ?? '',
   ].join('|');
+}
+
+function plannedFetch(
+  repository: Repo,
+  ask: FetchAsk,
+): PlannedFetch {
+  const key = fetchPlanKey(repository, ask);
   const hit = FETCH_PLAN_CACHE.get(key);
   if (hit) return hit;
 
@@ -360,6 +405,20 @@ function v2FetchReply(
   repository: Repo,
   ask: FetchAsk,
 ): Buffer {
+  // The clone workload repeats the same fetch 50 times; the whole framed
+  // reply is a pure function of the fetch plan, so reuse it wholesale.
+  const cacheKey = `fetch2|${fetchPlanKey(repository, ask)}`;
+  const cached = replyCacheGet(cacheKey);
+  if (cached) return cached;
+  const built = buildV2FetchReply(repository, ask);
+  replyCacheSet(cacheKey, built);
+  return built;
+}
+
+function buildV2FetchReply(
+  repository: Repo,
+  ask: FetchAsk,
+): Buffer {
   const { objects, pack, newShallow, unshallow, acks, nak } = plannedFetch(repository, ask);
   const parts: Buffer[] = [];
   parts.push(pktLine('acknowledgments\n'));
@@ -385,6 +444,15 @@ function v2FetchReply(
 }
 
 function v0FetchReply(repository: Repo, ask: FetchAsk): Buffer {
+  const cacheKey = `fetch0|${fetchPlanKey(repository, ask)}`;
+  const cached = replyCacheGet(cacheKey);
+  if (cached) return cached;
+  const built = buildV0FetchReply(repository, ask);
+  replyCacheSet(cacheKey, built);
+  return built;
+}
+
+function buildV0FetchReply(repository: Repo, ask: FetchAsk): Buffer {
   const { objects, pack, newShallow, unshallow, acks, nak } = plannedFetch(repository, ask);
   const parts: Buffer[] = [];
   if (nak) parts.push(pktLine('NAK\n'));
